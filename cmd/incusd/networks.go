@@ -29,6 +29,8 @@ import (
 	"github.com/lxc/incus/v6/internal/server/instance/instancetype"
 	"github.com/lxc/incus/v6/internal/server/lifecycle"
 	"github.com/lxc/incus/v6/internal/server/network"
+	ovn "github.com/lxc/incus/v6/internal/server/network/ovn"
+	ovnNB "github.com/lxc/incus/v6/internal/server/network/ovn/schema/ovn-nb"
 	"github.com/lxc/incus/v6/internal/server/project"
 	"github.com/lxc/incus/v6/internal/server/request"
 	"github.com/lxc/incus/v6/internal/server/response"
@@ -46,6 +48,34 @@ import (
 
 // Lock to prevent concurrent networks creation.
 var networkCreateLock sync.Mutex
+
+// retryOVNOperation retries an OVN operation with exponential backoff, up to maxDelay.
+func retryOVNOperation(ctx context.Context, maxDelay time.Duration, operation func() error) error {
+	const baseDelay = 100 * time.Millisecond
+	delay := baseDelay
+
+	for {
+		err := operation()
+		if err == nil {
+			return nil
+		}
+
+		if delay > maxDelay {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+}
 
 var networksCmd = APIEndpoint{
 	Path: "networks",
@@ -271,6 +301,39 @@ func networksGet(d *Daemon, r *http.Request) response.Response {
 				if !slices.Contains(networkNames[projectName], iface.Name) {
 					networkNames[projectName] = append(networkNames[projectName], iface.Name)
 					unmanagedNetworkNames = append(unmanagedNetworkNames, iface.Name)
+				}
+			}
+		}
+
+		// Detect unmanaged OVN logical switches.
+		ovnnb, _, err := s.OVN()
+		if err != nil {
+			logger.Debug("OVN not available, skipping unmanaged OVN detection")
+		} else {
+			ctx, cancel := context.WithTimeout(context.TODO(), 30*time.Second)
+			defer cancel()
+
+			var switches []*ovnNB.LogicalSwitch
+			err = retryOVNOperation(ctx, 30*time.Second, func() error {
+				var err error
+				switches, err = ovnnb.ListLogicalSwitches(ctx)
+				return err
+			})
+			if err != nil {
+				logger.Error("Failed to list OVN logical switches after retries", logger.Ctx{"err": err})
+			} else {
+				for _, sw := range switches {
+					name := sw.Name
+					// Validate switch name as per network naming requirements.
+					if err := validate.IsAPIName(name, false); err != nil {
+						logger.Warn("Skipping invalid OVN logical switch name", logger.Ctx{"name": name, "err": err})
+						continue
+					}
+					if !slices.Contains(networkNames[projectName], name) {
+						networkNames[projectName] = append(networkNames[projectName], name)
+						unmanagedNetworkNames = append(unmanagedNetworkNames, name)
+						logger.Debugf("Detected unmanaged OVN logical switch '%s'", name)
+					}
 				}
 			}
 		}
@@ -1059,16 +1122,28 @@ func doNetworkGet(s *state.State, r *http.Request, allNodes bool, projectName st
 	} else if util.PathExists(fmt.Sprintf("/sys/class/net/%s/bonding", apiNet.Name)) {
 		apiNet.Type = "bond"
 	} else {
-		vswitch, err := s.OVS()
-		if err != nil {
-			return api.Network{}, fmt.Errorf("Failed to connect to OVS: %w", err)
+		// Check if it's an unmanaged OVN logical switch.
+		ovnnb, _, err := s.OVN()
+		if err == nil {
+			_, err = ovnnb.GetLogicalSwitch(context.TODO(), ovn.OVNSwitch(apiNet.Name))
+			if err == nil {
+				apiNet.Type = "ovn"
+				logger.Debugf("Typed network '%s' as unmanaged OVN", apiNet.Name)
+			}
 		}
 
-		_, err = vswitch.GetBridge(context.TODO(), apiNet.Name)
-		if err == nil {
-			apiNet.Type = "bridge"
-		} else {
-			apiNet.Type = "unknown"
+		if apiNet.Type != "ovn" {
+			vswitch, err := s.OVS()
+			if err != nil {
+				return api.Network{}, fmt.Errorf("Failed to connect to OVS: %w", err)
+			}
+
+			_, err = vswitch.GetBridge(context.TODO(), apiNet.Name)
+			if err == nil {
+				apiNet.Type = "bridge"
+			} else {
+				apiNet.Type = "unknown"
+			}
 		}
 	}
 

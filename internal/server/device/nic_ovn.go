@@ -56,6 +56,8 @@ type nicOVN struct {
 	deviceCommon
 
 	network ovnNet // Populated in validateConfig().
+	isUnmanaged bool // Whether the network is unmanaged OVN.
+	portCreated bool // Whether we created the OVN port.
 
 	ovnnb *ovn.NB
 	ovnsb *ovn.SB
@@ -328,7 +330,21 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 	// Lookup network settings and apply them to the device's config.
 	n, err := network.LoadByName(d.state, networkProjectName, d.config["network"])
 	if err != nil {
-		return fmt.Errorf("Error loading network config for %q: %w", d.config["network"], err)
+		// Check if it's an unmanaged OVN network.
+		ovnnb, _, ovnErr := d.state.OVN()
+		if ovnErr != nil {
+			return fmt.Errorf("Error loading network config for %q: %w", d.config["network"], err)
+		}
+
+		_, ovnErr = ovnnb.GetLogicalSwitch(context.TODO(), ovn.OVNSwitch(d.config["network"]))
+		if ovnErr != nil {
+			return fmt.Errorf("Error loading network config for %q: %w", d.config["network"], err)
+		}
+
+		d.isUnmanaged = true
+		d.logger.Info("Attaching NIC to unmanaged OVN switch", logger.Ctx{"network": d.config["network"]})
+		// For unmanaged, skip further validation as network config is not available.
+		return nil
 	}
 
 	if n.Status() != api.NetworkStatusCreated {
@@ -645,6 +661,11 @@ func (d *nicOVN) checkAddressConflict() error {
 
 // Add is run when a device is added to a non-snapshot instance whether or not the instance is running.
 func (d *nicOVN) Add() error {
+	if d.isUnmanaged {
+		// For unmanaged OVN networks, port creation happens in Start.
+		return nil
+	}
+
 	return d.network.InstanceDevicePortAdd(d.inst.LocalConfig()["volatile.uuid"], d.name, d.config)
 }
 
@@ -904,17 +925,44 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 	}
 
 	// Add new OVN logical switch port for instance.
-	logicalPortName, dnsIPs, err := d.network.InstanceDevicePortStart(&network.OVNInstanceNICSetupOpts{
-		InstanceUUID: d.inst.LocalConfig()["volatile.uuid"],
-		DNSName:      d.inst.Name(),
-		DeviceName:   d.name,
-		DeviceConfig: d.config,
-		UplinkConfig: uplinkConfig,
-		LastStateIPs: lastStateIPs, // Pass in volatile last state IPs for use with sticky DHCPv4 hint.
-	}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("Failed setting up OVN port: %w", err)
+	var logicalPortName ovn.OVNSwitchPort
+	var dnsIPs []net.IP
+	if d.isUnmanaged {
+		// Create port for unmanaged OVN network.
+		logger.Debugf("Attaching NIC '%s' to unmanaged OVN logical switch '%s'", d.name, d.config["network"])
+		logicalPortName = ovn.OVNSwitchPort(fmt.Sprintf("%s-%s", d.inst.LocalConfig()["volatile.uuid"], d.name))
+
+		// Check if port already exists.
+		_, err := d.ovnnb.GetLogicalSwitchPortUUID(context.TODO(), logicalPortName)
+		if err == nil {
+			// Port already exists, log warning and use it.
+			d.logger.Warn("OVN port already exists, using existing port", logger.Ctx{"port": logicalPortName})
+			d.portCreated = false
+		} else {
+			// Port does not exist, create it.
+			err = d.ovnnb.CreateLogicalSwitchPort(context.TODO(), ovn.OVNSwitch(d.config["network"]), logicalPortName, nil, true)
+			if err != nil {
+				return nil, fmt.Errorf("Failed to create port on unmanaged OVN network: %w", err)
+			}
+			d.portCreated = true
+		}
+		dnsIPs = nil
+	} else {
+		logicalPortName, dnsIPs, err = d.network.InstanceDevicePortStart(&network.OVNInstanceNICSetupOpts{
+			InstanceUUID: d.inst.LocalConfig()["volatile.uuid"],
+			DNSName:      d.inst.Name(),
+			DeviceName:   d.name,
+			DeviceConfig: d.config,
+			UplinkConfig: uplinkConfig,
+			LastStateIPs: lastStateIPs, // Pass in volatile last state IPs for use with sticky DHCPv4 hint.
+		}, nil)
+		if err != nil {
+			return nil, fmt.Errorf("Failed setting up OVN port: %w", err)
+		}
 	}
+
+	// Save the OVN port name to volatile for cleanup on stop.
+	saveData["ovnPortName"] = string(logicalPortName)
 
 	// Record switch port DNS IPs to volatile so they can be used as sticky DHCPv4 hint in the future in order
 	// to allocate the same IPs on next start if they are still available/appropriate.
@@ -1223,14 +1271,28 @@ func (d *nicOVN) Stop() (*deviceConfig.RunConfig, error) {
 	}
 
 	instanceUUID := d.inst.LocalConfig()["volatile.uuid"]
-	err = d.network.InstanceDevicePortStop(ovn.OVNSwitchPort(ovsExternalOVNPort), &network.OVNInstanceNICStopOpts{
-		InstanceUUID: instanceUUID,
-		DeviceName:   d.name,
-		DeviceConfig: d.config,
-	})
-	if err != nil {
-		// Don't fail here as we still want the postStop hook to run to clean up the local veth pair.
-		d.logger.Error("Failed to remove OVN device port", logger.Ctx{"err": err})
+	if d.isUnmanaged {
+		// Delete port for unmanaged OVN network.
+		logger.Debugf("Detaching NIC '%s' from unmanaged OVN logical switch '%s'", d.name, d.config["network"])
+		v := d.volatileGet()
+		ovnPortName := v["ovnPortName"]
+		if ovnPortName != "" && d.portCreated {
+			err = d.ovnnb.DeleteLogicalSwitchPort(context.TODO(), ovn.OVNSwitch(d.config["network"]), ovn.OVNSwitchPort(ovnPortName))
+			if err != nil {
+				// Don't fail here as we still want the postStop hook to run to clean up the local veth pair.
+				d.logger.Error("Failed to delete OVN port", logger.Ctx{"err": err})
+			}
+		}
+	} else {
+		err = d.network.InstanceDevicePortStop(ovn.OVNSwitchPort(ovsExternalOVNPort), &network.OVNInstanceNICStopOpts{
+			InstanceUUID: instanceUUID,
+			DeviceName:   d.name,
+			DeviceConfig: d.config,
+		})
+		if err != nil {
+			// Don't fail here as we still want the postStop hook to run to clean up the local veth pair.
+			d.logger.Error("Failed to remove OVN device port", logger.Ctx{"err": err})
+		}
 	}
 
 	// Remove BGP announcements.
