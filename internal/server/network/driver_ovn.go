@@ -74,6 +74,9 @@ type ovnUplinkVars struct {
 	// DNS.
 	dnsIPv6 []net.IP
 	dnsIPv4 []net.IP
+
+	// Uplink end for special cases.
+	uplinkEnd string
 }
 
 // ovnUplinkPortBridgeVars uplink bridge port variables used for start/stop.
@@ -106,6 +109,10 @@ type ovn struct {
 
 	ovnnb *networkOVN.NB
 	ovnsb *networkOVN.SB
+
+	// Fields for unmanaged OVN networks
+	isUnmanaged bool
+	uplinkEnd   string
 }
 
 func (n *ovn) init(s *state.State, id int64, projectName string, netInfo *api.Network, netNodes map[int64]db.NetworkNode) error {
@@ -1249,6 +1256,19 @@ func (n *ovn) setupUplinkPort(routerMAC net.HardwareAddr) (*ovnUplinkVars, error
 	// Uplink network must be in default project.
 	uplinkNet, err := LoadByName(n.state, api.ProjectDefaultName, n.config["network"])
 	if err != nil {
+		// Check if it's an unmanaged OVN logical switch.
+		ovnnb, _, ovnErr := n.state.OVN()
+		if ovnErr == nil {
+			_, ovnErr = ovnnb.GetLogicalSwitch(context.TODO(), networkOVN.OVNSwitch(n.config["network"]))
+			if ovnErr == nil {
+				// It's an unmanaged OVN, handle as special case.
+				logger.Debugf("Using unmanaged OVN logical switch '%s' as uplink", n.config["network"])
+				return &ovnUplinkVars{
+					uplinkEnd: "ovn:" + n.config["network"],
+				}, nil
+			}
+		}
+
 		return nil, fmt.Errorf("Failed loading uplink network %q: %w", n.config["network"], err)
 	}
 
@@ -2231,6 +2251,16 @@ func (n *ovn) validateUplinkNetwork(p *api.Project, uplinkNetworkName string) (s
 
 	if uplinkNetworkName != "" {
 		if !slices.Contains(allowedUplinkNetworks, uplinkNetworkName) {
+			// Check if it's an unmanaged OVN logical switch.
+			ovnnb, _, err := n.state.OVN()
+			if err == nil {
+				_, err = ovnnb.GetLogicalSwitch(context.TODO(), networkOVN.OVNSwitch(uplinkNetworkName))
+				if err == nil {
+					logger.Debugf("Detected unmanaged OVN logical switch '%s' as uplink", uplinkNetworkName)
+					return uplinkNetworkName, nil
+				}
+			}
+
 			return "", fmt.Errorf(`Option "network" value %q is not one of the allowed uplink networks in project`, uplinkNetworkName)
 		}
 
@@ -2480,13 +2510,23 @@ func (n *ovn) setup(update bool) error {
 	}
 
 	if len(extRouterIPs) > 0 {
-		err = n.ovnnb.CreateLogicalSwitch(context.TODO(), n.getExtSwitchName(), update)
-		if err != nil {
-			return fmt.Errorf("Failed adding external switch: %w", err)
+		extSwitchName := n.getExtSwitchName()
+		isOVNUplink := false
+		if uplinkNet != nil && strings.HasPrefix(uplinkNet.uplinkEnd, "ovn:") {
+			extSwitchName = networkOVN.OVNSwitch(strings.TrimPrefix(uplinkNet.uplinkEnd, "ovn:"))
+			isOVNUplink = true
+			n.logger.Info("Using unmanaged OVN switch as uplink", logger.Ctx{"switch": string(extSwitchName)})
 		}
 
-		if !update {
-			reverter.Add(func() { _ = n.ovnnb.DeleteLogicalSwitch(context.TODO(), n.getExtSwitchName()) })
+		if !isOVNUplink {
+			err = n.ovnnb.CreateLogicalSwitch(context.TODO(), extSwitchName, update)
+			if err != nil {
+				return fmt.Errorf("Failed adding external switch: %w", err)
+			}
+
+			if !update {
+				reverter.Add(func() { _ = n.ovnnb.DeleteLogicalSwitch(context.TODO(), extSwitchName) })
+			}
 		}
 
 		// Create external router port.
@@ -2502,14 +2542,14 @@ func (n *ovn) setup(update bool) error {
 		}
 
 		// Create external switch port and link to router port.
-		err = n.ovnnb.CreateLogicalSwitchPort(context.TODO(), n.getExtSwitchName(), n.getExtSwitchRouterPortName(), nil, update)
+		err = n.ovnnb.CreateLogicalSwitchPort(context.TODO(), extSwitchName, n.getExtSwitchRouterPortName(), nil, update)
 		if err != nil {
 			return fmt.Errorf("Failed adding external switch router port: %w", err)
 		}
 
 		if !update {
 			reverter.Add(func() {
-				_ = n.ovnnb.DeleteLogicalSwitchPort(context.TODO(), n.getExtSwitchName(), n.getExtSwitchRouterPortName())
+				_ = n.ovnnb.DeleteLogicalSwitchPort(context.TODO(), extSwitchName, n.getExtSwitchRouterPortName())
 			})
 		}
 
@@ -2518,22 +2558,24 @@ func (n *ovn) setup(update bool) error {
 			return fmt.Errorf("Failed linking external router port to external switch port: %w", err)
 		}
 
-		// Create external switch port and link to external provider network.
-		err = n.ovnnb.CreateLogicalSwitchPort(context.TODO(), n.getExtSwitchName(), n.getExtSwitchProviderPortName(), nil, update)
-		if err != nil {
-			return fmt.Errorf("Failed adding external switch provider port: %w", err)
-		}
-
-		if !update {
-			reverter.Add(func() {
-				_ = n.ovnnb.DeleteLogicalSwitchPort(context.TODO(), n.getExtSwitchName(), n.getExtSwitchProviderPortName())
-			})
-		}
-
-		if uplinkNet != nil {
-			err = n.ovnnb.UpdateLogicalSwitchPortLinkProviderNetwork(context.TODO(), n.getExtSwitchProviderPortName(), uplinkNet.extSwitchProviderName)
+		if !isOVNUplink {
+			// Create external switch port and link to external provider network.
+			err = n.ovnnb.CreateLogicalSwitchPort(context.TODO(), extSwitchName, n.getExtSwitchProviderPortName(), nil, update)
 			if err != nil {
-				return fmt.Errorf("Failed linking external switch provider port to external provider network: %w", err)
+				return fmt.Errorf("Failed adding external switch provider port: %w", err)
+			}
+
+			if !update {
+				reverter.Add(func() {
+					_ = n.ovnnb.DeleteLogicalSwitchPort(context.TODO(), extSwitchName, n.getExtSwitchProviderPortName())
+				})
+			}
+
+			if uplinkNet != nil {
+				err = n.ovnnb.UpdateLogicalSwitchPortLinkProviderNetwork(context.TODO(), n.getExtSwitchProviderPortName(), uplinkNet.extSwitchProviderName)
+				if err != nil {
+					return fmt.Errorf("Failed linking external switch provider port to external provider network: %w", err)
+				}
 			}
 		}
 
@@ -7526,4 +7568,354 @@ func (n *ovn) loadBalancerBGPSetupPrefixes() error {
 	}
 
 	return nil
+}
+
+// getTunnels fetches tunnels from a network configuration.
+func (n *ovn) getTunnels(config map[string]string) []string {
+	tunnels := []string{}
+
+	for k := range config {
+		if !strings.HasPrefix(k, "tunnel.") {
+			continue
+		}
+
+		fields := strings.Split(k, ".")
+		if !slices.Contains(tunnels, fields[1]) {
+			tunnels = append(tunnels, fields[1])
+		}
+	}
+
+	return tunnels
+}
+
+// getTunnelsFromChangedKeys fetches tunnels from a string slice.
+func (n *ovn) getTunnelsFromChangedKeys(keys []string) []string {
+	tunnels := make(map[string]string)
+	for _, v := range keys {
+		tunnels[v] = ""
+	}
+
+	return n.getTunnels(tunnels)
+}
+
+// getTunnelFullName returns a full name of a tunnel.
+func (n *ovn) getTunnelFullName(tunnel string, idx int) string {
+	return fmt.Sprintf("%s-%s-%d", n.name, tunnel, idx)
+}
+
+// getTunnelLspName returns a name of a lsp for a tunnel.
+func (n *ovn) getTunnelLspName(tunnel string) string {
+	return fmt.Sprintf("tunnel-%s", tunnel)
+}
+
+// updateTunnels updates the tunnel configuration by removing and recreating all necessary objects.
+// When the 'reinitialize' flag is set, it removes and recreates all tunnels from the configuration,
+// not just those referenced in changedKeys.
+func (n *ovn) updateTunnels(newConfig map[string]string, changedKeys []string, reinitialize bool) error {
+	err := n.deleteTunnels(changedKeys, false, reinitialize)
+	if err != nil {
+		return err
+	}
+
+	chassisName, err := n.getActiveChassisName()
+	if err != nil {
+		return err
+	}
+
+	if chassisName == n.state.ServerName || chassisName == n.state.OS.Hostname {
+		err := n.deleteTunnels(changedKeys, true, reinitialize)
+		if err != nil {
+			return err
+		}
+
+		err = n.createTunnels(newConfig)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// createTunnels creates tunnels specified in the config.
+func (n *ovn) createTunnels(newConfig map[string]string) error {
+	var err error
+
+	tunnels := n.getTunnels(newConfig)
+	// Configure tunnels.
+	for _, tunnel := range tunnels {
+		getConfig := func(key string) string {
+			return newConfig[fmt.Sprintf("tunnel.%s.%s", tunnel, key)]
+		}
+
+		tunProtocol := getConfig("protocol")
+
+		// Configure the tunnel.
+		switch tunProtocol {
+		case "gre":
+			remotes := getConfig("remote")
+			tunLocal := net.ParseIP(getConfig("local"))
+
+			for idx, remote := range strings.Split(remotes, ",") {
+				tunRemote := net.ParseIP(strings.TrimSpace(remote))
+				tunName := n.getTunnelFullName(tunnel, idx)
+				// Skip partial configs.
+				if tunLocal == nil || tunRemote == nil {
+					return nil
+				}
+
+				gretap := &ip.Gretap{
+					Link:   ip.Link{Name: tunName},
+					Local:  tunLocal,
+					Remote: tunRemote,
+				}
+
+				err := gretap.Add()
+				if err != nil {
+					return err
+				}
+
+				err = gretap.SetUp()
+				if err != nil {
+					return err
+				}
+
+				err = n.createOVNTunnel(tunName)
+				if err != nil {
+					return err
+				}
+			}
+		case "vxlan":
+			tunName := n.getTunnelFullName(tunnel, 0)
+			tunGroup := net.ParseIP(getConfig("group"))
+			tunInterface := getConfig("interface")
+
+			vxlan := &ip.Vxlan{
+				Link: ip.Link{Name: tunName},
+			}
+
+			if tunGroup == nil {
+				tunGroup = net.IPv4(239, 0, 0, 1) // 239.0.0.1
+			}
+
+			devName := tunInterface
+			if devName == "" {
+				_, devName, err = DefaultGatewaySubnetV4()
+				if err != nil {
+					return err
+				}
+			}
+
+			vxlan.Group = tunGroup
+			vxlan.DevName = devName
+
+			tunPort := getConfig("port")
+			if tunPort != "" {
+				vxlan.DstPort, err = strconv.Atoi(tunPort)
+				if err != nil {
+					return err
+				}
+			}
+
+			tunID := getConfig("id")
+			if tunID == "" {
+				vxlan.VxlanID = 1
+			} else {
+				vxlan.VxlanID, err = strconv.Atoi(tunID)
+				if err != nil {
+					return err
+				}
+			}
+
+			tunTTL := getConfig("ttl")
+			if tunTTL == "" {
+				vxlan.TTL = 1
+			} else {
+				vxlan.TTL, err = strconv.Atoi(tunTTL)
+				if err != nil {
+					return err
+				}
+			}
+
+			err := vxlan.Add()
+			if err != nil {
+				return err
+			}
+
+			err = vxlan.SetUp()
+			if err != nil {
+				return err
+			}
+
+			err = n.createOVNTunnel(tunName)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// createOVNTunnel creates OVN objects needed for a tunnel.
+func (n *ovn) createOVNTunnel(tunName string) error {
+	reverter := revert.New()
+	defer reverter.Fail()
+
+	lspName := networkOVN.OVNSwitchPort(n.getTunnelLspName(tunName))
+	err := n.ovnnb.CreateLogicalSwitchPort(context.TODO(), n.getIntSwitchName(), lspName, &networkOVN.OVNSwitchPortOpts{
+		IPV4:        "none",
+		IPV6:        "none",
+		Promiscuous: true,
+	}, true)
+	if err != nil {
+		return fmt.Errorf("Failed to create logical switch port for %s: %w", tunName, err)
+	}
+
+	reverter.Add(func() {
+		_ = n.ovnnb.DeleteLogicalSwitchPort(context.TODO(), n.getIntSwitchName(), lspName)
+	})
+
+	integrationBridge := n.state.GlobalConfig.NetworkOVNIntegrationBridge()
+
+	vswitch, err := n.state.OVS()
+	if err != nil {
+		return fmt.Errorf("Failed to connect to OVS: %w", err)
+	}
+
+	err = vswitch.CreateBridgePort(context.TODO(), integrationBridge, tunName, true)
+	if err != nil {
+		return err
+	}
+
+	reverter.Add(func() { _ = vswitch.DeleteBridgePort(context.TODO(), integrationBridge, tunName) })
+
+	// Link OVS port to OVN logical port.
+	err = vswitch.AssociateInterfaceOVNSwitchPort(context.TODO(), tunName, string(lspName))
+	if err != nil {
+		return err
+	}
+
+	reverter.Success()
+	return nil
+}
+
+// deleteTunnels removes tunnels from the system and OVN (if needed).
+// When the 'deleteAll' flag is set, it removes all tunnels specified in the
+// configuration, not just those listed in changedKeys.
+func (n *ovn) deleteTunnels(config []string, withOVN bool, deleteAll bool) error {
+	var tunnels []string
+
+	if deleteAll {
+		tunnels = n.getTunnels(n.config)
+	} else {
+		tunnels = n.getTunnelsFromChangedKeys(config)
+	}
+
+	for _, tunnel := range tunnels {
+		err := n.deleteLinkTunnel(tunnel)
+		if err != nil {
+			return err
+		}
+
+		if withOVN {
+			err = n.deleteOVNTunnel(tunnel)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// deleteLinkTunnel removes tunnel-related interfaces from the system.
+func (n *ovn) deleteLinkTunnel(tunnel string) error {
+	idx := 0
+	for {
+		tunName := n.getTunnelFullName(tunnel, idx)
+
+		l, err := ip.LinkByName(tunName)
+		if err != nil {
+			// If interface doesn't exist assume there is no more valid tunnels.
+			return nil
+		}
+
+		err = l.Delete()
+		if err != nil {
+			return err
+		}
+
+		idx += 1
+	}
+}
+
+// deleteOVNTunnel removes tunnel-related objects from OVN.
+func (n *ovn) deleteOVNTunnel(tunnel string) error {
+	idx := 0
+	for {
+		tunName := n.getTunnelFullName(tunnel, idx)
+
+		integrationBridge := n.state.GlobalConfig.NetworkOVNIntegrationBridge()
+
+		vswitch, err := n.state.OVS()
+		if err != nil {
+			return fmt.Errorf("Failed to connect to OVS: %w", err)
+		}
+
+		ports, err := vswitch.GetBridgePorts(context.TODO(), integrationBridge)
+		if err != nil {
+			return err
+		}
+
+		if !slices.Contains(ports, tunName) {
+			// If logical port doesn't exist assume there is no more valid ports.
+			return nil
+		}
+
+		err = vswitch.DeleteBridgePort(context.TODO(), integrationBridge, tunName)
+		if err != nil {
+			return err
+		}
+
+		lspName := networkOVN.OVNSwitchPort(n.getTunnelLspName(tunName))
+		err = n.ovnnb.DeleteLogicalSwitchPort(context.TODO(), n.getIntSwitchName(), lspName)
+		if err != nil {
+			return err
+		}
+
+		idx += 1
+	}
+}
+
+// getActiveChassisName retrieves the active chassis name.
+func (n *ovn) getActiveChassisName() (string, error) {
+	if n.config["network"] == "none" {
+		return "", nil
+	}
+
+	// Get the current active chassis.
+	chassis, err := n.ovnsb.GetLogicalRouterPortActiveChassisHostname(context.TODO(), n.getRouterExtPortName())
+	if err != nil {
+		return "", err
+	}
+
+	return chassis, nil
+}
+
+// ListLogicalSwitches retrieves the names of all logical switches from OVN.
+// For unmanaged networks, this allows detection of existing switches.
+func (n *ovn) ListLogicalSwitches() ([]string, error) {
+	switches, err := n.ovnnb.ListLogicalSwitches(context.TODO())
+	if err != nil {
+		logger.Errorf("Failed to list logical switches from OVN: %v", err)
+		return nil, err
+	}
+
+	names := make([]string, 0, len(switches))
+	for _, s := range switches {
+		names = append(names, s.Name)
+	}
+
+	return names, nil
 }
