@@ -21,21 +21,26 @@ type mockOVNClient struct {
 
 func (m *mockOVNClient) ListLogicalSwitches(ctx context.Context) ([]*ovnNB.LogicalSwitch, error) {
 	args := m.Called(ctx)
-	if args.Get(0) != nil {
-		return args.Get(0).([]*ovnNB.LogicalSwitch), args.Error(1)
+	val, ok := args.Get(0).([]*ovnNB.LogicalSwitch)
+	if ok {
+		return val, args.Error(1)
 	}
+
 	return m.switches, args.Error(1)
 }
 
 func (m *mockOVNClient) GetLogicalSwitchPortUUID(ctx context.Context, portName ovn.OVNSwitchPort) (ovn.OVNSwitchPortUUID, error) {
 	args := m.Called(ctx, portName)
-	if args.Get(0) != nil {
-		return args.Get(0).(ovn.OVNSwitchPortUUID), args.Error(1)
+	val, ok := args.Get(0).(ovn.OVNSwitchPortUUID)
+	if ok {
+		return val, args.Error(1)
 	}
 	// Check if port exists in mock state
-	if _, exists := m.ports[string(portName)]; exists {
+	_, exists := m.ports[string(portName)]
+	if exists {
 		return ovn.OVNSwitchPortUUID("mock-uuid-" + string(portName)), nil
 	}
+
 	return "", ovn.ErrNotFound // Simulate not found
 }
 
@@ -48,10 +53,12 @@ func (m *mockOVNClient) CreateLogicalSwitchPort(ctx context.Context, switchName 
 	if m.ports == nil {
 		m.ports = make(map[string]*ovnNB.LogicalSwitchPort)
 	}
+
 	m.ports[string(portName)] = &ovnNB.LogicalSwitchPort{
 		Name:    string(portName),
 		Options: options,
 	}
+
 	return nil
 }
 

@@ -64,6 +64,7 @@ func TestOVNListLogicalSwitches_Extraction(t *testing.T) {
 			if len(names) != len(tt.expectedSwitches) {
 				t.Errorf("expected %d switches, got %d", len(tt.expectedSwitches), len(names))
 			}
+
 			for i, expected := range tt.expectedSwitches {
 				if i >= len(names) || names[i] != expected {
 					t.Errorf("at index %d, expected %q, got %q", i, expected, names[i])
