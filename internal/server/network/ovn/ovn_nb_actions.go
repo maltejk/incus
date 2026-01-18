@@ -1044,6 +1044,13 @@ func (o *NB) GetLogicalSwitch(ctx context.Context, switchName OVNSwitch) (*ovnNB
 	return logicalSwitch, nil
 }
 
+// ListLogicalSwitches gets all OVN logical switches.
+func (o *NB) ListLogicalSwitches(ctx context.Context) ([]*ovnNB.LogicalSwitch, error) {
+	var switches []*ovnNB.LogicalSwitch
+	err := o.client.Where(&ovnNB.LogicalSwitch{}).List(ctx, &switches)
+	return switches, err
+}
+
 // CreateLogicalSwitch adds a named logical switch.
 // If mayExist is true, then an existing resource of the same name is not treated as an error.
 func (o *NB) CreateLogicalSwitch(ctx context.Context, switchName OVNSwitch, mayExist bool) error {

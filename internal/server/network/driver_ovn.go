@@ -77,6 +77,9 @@ type ovnUplinkVars struct {
 	// DNS.
 	dnsIPv6 []net.IP
 	dnsIPv4 []net.IP
+
+	// Uplink end for special cases.
+	uplinkEnd string
 }
 
 // ovnUplinkPortBridgeVars uplink bridge port variables used for start/stop.
@@ -1368,6 +1371,19 @@ func (n *ovn) setupUplinkPort(routerMAC net.HardwareAddr) (*ovnUplinkVars, error
 	// Uplink network must be in default project.
 	uplinkNet, err := LoadByName(n.state, api.ProjectDefaultName, n.config["network"])
 	if err != nil {
+		// Check if it's an unmanaged OVN logical switch.
+		ovnnb, _, ovnErr := n.state.OVN()
+		if ovnErr == nil {
+			_, ovnErr = ovnnb.GetLogicalSwitch(context.TODO(), networkOVN.OVNSwitch(n.config["network"]))
+			if ovnErr == nil {
+				// It's an unmanaged OVN, handle as special case.
+				logger.Debugf("Using unmanaged OVN logical switch '%s' as uplink", n.config["network"])
+				return &ovnUplinkVars{
+					uplinkEnd: "ovn:" + n.config["network"],
+				}, nil
+			}
+		}
+
 		return nil, fmt.Errorf("Failed loading uplink network %q: %w", n.config["network"], err)
 	}
 
@@ -2355,6 +2371,16 @@ func (n *ovn) validateUplinkNetwork(p *api.Project, uplinkNetworkName string) (s
 
 	if uplinkNetworkName != "" {
 		if !slices.Contains(allowedUplinkNetworks, uplinkNetworkName) {
+			// Check if it's an unmanaged OVN logical switch.
+			ovnnb, _, err := n.state.OVN()
+			if err == nil {
+				_, err = ovnnb.GetLogicalSwitch(context.TODO(), networkOVN.OVNSwitch(uplinkNetworkName))
+				if err == nil {
+					logger.Debugf("Detected unmanaged OVN logical switch '%s' as uplink", uplinkNetworkName)
+					return uplinkNetworkName, nil
+				}
+			}
+
 			return "", fmt.Errorf(`Option "network" value %q is not one of the allowed uplink networks in project`, uplinkNetworkName)
 		}
 
@@ -2604,13 +2630,23 @@ func (n *ovn) setup(update bool) error {
 	}
 
 	if len(extRouterIPs) > 0 {
-		err = n.ovnnb.CreateLogicalSwitch(context.TODO(), n.getExtSwitchName(), update)
-		if err != nil {
-			return fmt.Errorf("Failed adding external switch: %w", err)
+		extSwitchName := n.getExtSwitchName()
+		isOVNUplink := false
+		if uplinkNet != nil && strings.HasPrefix(uplinkNet.uplinkEnd, "ovn:") {
+			extSwitchName = networkOVN.OVNSwitch(strings.TrimPrefix(uplinkNet.uplinkEnd, "ovn:"))
+			isOVNUplink = true
+			n.logger.Info("Using unmanaged OVN switch as uplink", logger.Ctx{"switch": string(extSwitchName)})
 		}
 
-		if !update {
-			reverter.Add(func() { _ = n.ovnnb.DeleteLogicalSwitch(context.TODO(), n.getExtSwitchName()) })
+		if !isOVNUplink {
+			err = n.ovnnb.CreateLogicalSwitch(context.TODO(), extSwitchName, update)
+			if err != nil {
+				return fmt.Errorf("Failed adding external switch: %w", err)
+			}
+
+			if !update {
+				reverter.Add(func() { _ = n.ovnnb.DeleteLogicalSwitch(context.TODO(), extSwitchName) })
+			}
 		}
 
 		// Create external router port.
@@ -2626,14 +2662,14 @@ func (n *ovn) setup(update bool) error {
 		}
 
 		// Create external switch port and link to router port.
-		err = n.ovnnb.CreateLogicalSwitchPort(context.TODO(), n.getExtSwitchName(), n.getExtSwitchRouterPortName(), nil, update)
+		err = n.ovnnb.CreateLogicalSwitchPort(context.TODO(), extSwitchName, n.getExtSwitchRouterPortName(), nil, update)
 		if err != nil {
 			return fmt.Errorf("Failed adding external switch router port: %w", err)
 		}
 
 		if !update {
 			reverter.Add(func() {
-				_ = n.ovnnb.DeleteLogicalSwitchPort(context.TODO(), n.getExtSwitchName(), n.getExtSwitchRouterPortName())
+				_ = n.ovnnb.DeleteLogicalSwitchPort(context.TODO(), extSwitchName, n.getExtSwitchRouterPortName())
 			})
 		}
 
@@ -2642,22 +2678,24 @@ func (n *ovn) setup(update bool) error {
 			return fmt.Errorf("Failed linking external router port to external switch port: %w", err)
 		}
 
-		// Create external switch port and link to external provider network.
-		err = n.ovnnb.CreateLogicalSwitchPort(context.TODO(), n.getExtSwitchName(), n.getExtSwitchProviderPortName(), nil, update)
-		if err != nil {
-			return fmt.Errorf("Failed adding external switch provider port: %w", err)
-		}
-
-		if !update {
-			reverter.Add(func() {
-				_ = n.ovnnb.DeleteLogicalSwitchPort(context.TODO(), n.getExtSwitchName(), n.getExtSwitchProviderPortName())
-			})
-		}
-
-		if uplinkNet != nil {
-			err = n.ovnnb.UpdateLogicalSwitchPortLinkProviderNetwork(context.TODO(), n.getExtSwitchProviderPortName(), uplinkNet.extSwitchProviderName)
+		if !isOVNUplink {
+			// Create external switch port and link to external provider network.
+			err = n.ovnnb.CreateLogicalSwitchPort(context.TODO(), extSwitchName, n.getExtSwitchProviderPortName(), nil, update)
 			if err != nil {
-				return fmt.Errorf("Failed linking external switch provider port to external provider network: %w", err)
+				return fmt.Errorf("Failed adding external switch provider port: %w", err)
+			}
+
+			if !update {
+				reverter.Add(func() {
+					_ = n.ovnnb.DeleteLogicalSwitchPort(context.TODO(), extSwitchName, n.getExtSwitchProviderPortName())
+				})
+			}
+
+			if uplinkNet != nil {
+				err = n.ovnnb.UpdateLogicalSwitchPortLinkProviderNetwork(context.TODO(), n.getExtSwitchProviderPortName(), uplinkNet.extSwitchProviderName)
+				if err != nil {
+					return fmt.Errorf("Failed linking external switch provider port to external provider network: %w", err)
+				}
 			}
 		}
 
@@ -8240,4 +8278,21 @@ func (n *ovn) getActiveChassisName() (string, error) {
 	}
 
 	return chassis, nil
+}
+
+// ListLogicalSwitches retrieves the names of all logical switches from OVN.
+// For unmanaged networks, this allows detection of existing switches.
+func (n *ovn) ListLogicalSwitches() ([]string, error) {
+	switches, err := n.ovnnb.ListLogicalSwitches(context.TODO())
+	if err != nil {
+		logger.Errorf("Failed to list logical switches from OVN: %v", err)
+		return nil, err
+	}
+
+	names := make([]string, 0, len(switches))
+	for _, s := range switches {
+		names = append(names, s.Name)
+	}
+
+	return names, nil
 }
