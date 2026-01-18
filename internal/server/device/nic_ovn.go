@@ -944,8 +944,10 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 			if err != nil {
 				return nil, fmt.Errorf("Failed to create port on unmanaged OVN network: %w", err)
 			}
+
 			d.portCreated = true
 		}
+
 		dnsIPs = nil
 	} else {
 		logicalPortName, dnsIPs, err = d.network.InstanceDevicePortStart(&network.OVNInstanceNICSetupOpts{

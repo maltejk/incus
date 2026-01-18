@@ -29,7 +29,7 @@ import (
 	"github.com/lxc/incus/v6/internal/server/instance/instancetype"
 	"github.com/lxc/incus/v6/internal/server/lifecycle"
 	"github.com/lxc/incus/v6/internal/server/network"
-	ovn "github.com/lxc/incus/v6/internal/server/network/ovn"
+	"github.com/lxc/incus/v6/internal/server/network/ovn"
 	ovnNB "github.com/lxc/incus/v6/internal/server/network/ovn/schema/ovn-nb"
 	"github.com/lxc/incus/v6/internal/server/project"
 	"github.com/lxc/incus/v6/internal/server/request"
@@ -325,10 +325,12 @@ func networksGet(d *Daemon, r *http.Request) response.Response {
 				for _, sw := range switches {
 					name := sw.Name
 					// Validate switch name as per network naming requirements.
-					if err := validate.IsAPIName(name, false); err != nil {
+					err := validate.IsAPIName(name, false)
+					if err != nil {
 						logger.Warn("Skipping invalid OVN logical switch name", logger.Ctx{"name": name, "err": err})
 						continue
 					}
+
 					if !slices.Contains(networkNames[projectName], name) {
 						networkNames[projectName] = append(networkNames[projectName], name)
 						unmanagedNetworkNames = append(unmanagedNetworkNames, name)

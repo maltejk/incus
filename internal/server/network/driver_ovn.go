@@ -112,10 +112,6 @@ type ovn struct {
 
 	ovnnb *networkOVN.NB
 	ovnsb *networkOVN.SB
-
-	// Fields for unmanaged OVN networks
-	isUnmanaged bool
-	uplinkEnd   string
 }
 
 func (n *ovn) init(s *state.State, id int64, projectName string, netInfo *api.Network, netNodes map[int64]db.NetworkNode) error {
