@@ -26,6 +26,7 @@ require (
 	github.com/jochenvg/go-udev v0.0.0-20240801134859-b65ed646224b
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/lxc/go-lxc v0.0.0-20240606200241-27b3d116511f
+	github.com/lxc/incus-os/incus-osd v0.0.0-20250805213219-9eed355243be
 	github.com/mattn/go-colorable v0.1.14
 	github.com/mattn/go-sqlite3 v1.14.31
 	github.com/mdlayher/arp v0.0.0-20220512170110-6706a2966875
@@ -96,7 +97,6 @@ require (
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/kr/fs v0.1.0 // indirect
-	github.com/lxc/incus-os/incus-osd v0.0.0-20250805213219-9eed355243be // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
 	github.com/mdlayher/ethernet v0.0.0-20220221185849-529eae5b6118 // indirect
@@ -133,6 +133,7 @@ require (
 	github.com/spf13/afero v1.14.0 // indirect
 	github.com/spf13/cast v1.9.2 // indirect
 	github.com/spf13/viper v1.20.1 // indirect
+	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/tinylib/msgp v1.3.0 // indirect
 	github.com/urfave/cli v1.22.17 // indirect

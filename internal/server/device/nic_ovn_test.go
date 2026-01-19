@@ -15,57 +15,35 @@ import (
 // mockOVNClient is a mock implementation of the OVN NB client for testing.
 type mockOVNClient struct {
 	mock.Mock
-	switches []*ovnNB.LogicalSwitch
-	ports    map[string]*ovnNB.LogicalSwitchPort
 }
 
 func (m *mockOVNClient) ListLogicalSwitches(ctx context.Context) ([]*ovnNB.LogicalSwitch, error) {
 	args := m.Called(ctx)
-	if args.Get(0) != nil {
-		return args.Get(0).([]*ovnNB.LogicalSwitch), args.Error(1)
+	if switches, ok := args.Get(0).([]*ovnNB.LogicalSwitch); ok {
+		return switches, args.Error(1)
 	}
-	return m.switches, args.Error(1)
+	return nil, args.Error(1)
 }
 
 func (m *mockOVNClient) GetLogicalSwitchPortUUID(ctx context.Context, portName ovn.OVNSwitchPort) (ovn.OVNSwitchPortUUID, error) {
 	args := m.Called(ctx, portName)
-	if args.Get(0) != nil {
-		return args.Get(0).(ovn.OVNSwitchPortUUID), args.Error(1)
+	if uuid, ok := args.Get(0).(ovn.OVNSwitchPortUUID); ok {
+		return uuid, args.Error(1)
 	}
-	// Check if port exists in mock state
-	if _, exists := m.ports[string(portName)]; exists {
-		return ovn.OVNSwitchPortUUID("mock-uuid-" + string(portName)), nil
-	}
-	return "", ovn.ErrNotFound // Simulate not found
+	return "", args.Error(1)
 }
 
 func (m *mockOVNClient) CreateLogicalSwitchPort(ctx context.Context, switchName ovn.OVNSwitch, portName ovn.OVNSwitchPort, options map[string]string, mayExist bool) error {
 	args := m.Called(ctx, switchName, portName, options, mayExist)
-	if args.Error(0) != nil {
-		return args.Error(0)
-	}
-	// Add to mock state
-	if m.ports == nil {
-		m.ports = make(map[string]*ovnNB.LogicalSwitchPort)
-	}
-	m.ports[string(portName)] = &ovnNB.LogicalSwitchPort{
-		Name:    string(portName),
-		Options: options,
-	}
-	return nil
+	return args.Error(0)
 }
 
 func (m *mockOVNClient) DeleteLogicalSwitchPort(ctx context.Context, switchName ovn.OVNSwitch, portName ovn.OVNSwitchPort) error {
 	args := m.Called(ctx, switchName, portName)
-	if args.Error(0) != nil {
-		return args.Error(0)
-	}
-	// Remove from mock state
-	delete(m.ports, string(portName))
-	return nil
+	return args.Error(0)
 }
 
-// generateTestOVNData creates realistic test data for OVN switches and ports, including edge cases.
+// generateTestOVNData creates realistic test data for OVN switches.
 func generateTestOVNData() ([]*ovnNB.LogicalSwitch, map[string]*ovnNB.LogicalSwitchPort) {
 	switches := []*ovnNB.LogicalSwitch{
 		{Name: "ovn-switch-1"},           // Valid managed-style name
@@ -102,9 +80,10 @@ func generateTestOVNData() ([]*ovnNB.LogicalSwitch, map[string]*ovnNB.LogicalSwi
 func TestNicOVN_Start_Unmanaged_PortExists(t *testing.T) {
 	// Test that when an OVN port already exists, we log a warning and use it without creating a new one.
 	mockOVN := &mockOVNClient{}
-	switches, ports := generateTestOVNData()
-	mockOVN.switches = switches
-	mockOVN.ports = ports
+	switches, _ := generateTestOVNData()
+
+	// Mock ListLogicalSwitches to return the switches.
+	mockOVN.On("ListLogicalSwitches", mock.Anything).Return(switches, nil)
 
 	// Mock GetLogicalSwitchPortUUID to return existing UUID for the port.
 	mockOVN.On("GetLogicalSwitchPortUUID", mock.Anything, mock.AnythingOfType("ovn.OVNSwitchPort")).Return(ovn.OVNSwitchPortUUID("existing-uuid"), nil)
@@ -121,7 +100,9 @@ func TestNicOVN_Start_Unmanaged_PortNotExists(t *testing.T) {
 	// Test that when OVN port doesn't exist, we create it and mark portCreated=true.
 	mockOVN := &mockOVNClient{}
 	switches, _ := generateTestOVNData()
-	mockOVN.switches = switches
+
+	// Mock ListLogicalSwitches to return the switches.
+	mockOVN.On("ListLogicalSwitches", mock.Anything).Return(switches, nil)
 
 	// Mock GetLogicalSwitchPortUUID to return error (port not found).
 	mockOVN.On("GetLogicalSwitchPortUUID", mock.Anything, mock.AnythingOfType("ovn.OVNSwitchPort")).Return(ovn.OVNSwitchPortUUID(""), ovn.ErrNotFound)
