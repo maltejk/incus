@@ -4,30 +4,31 @@ import (
 	"errors"
 	"fmt"
 
+	internalInstance "github.com/lxc/incus/v7/internal/instance"
 	"github.com/lxc/incus/v7/shared/api"
 )
 
-// MetadataVersion1 is the original backup metadata format, used by Incus and LXD before 6.x.
-const MetadataVersion1 = 1
-
-// MetadataVersion2 is the LXD 6.x format, converted to the internal format on load.
-const MetadataVersion2 = 2
-
-// Volume represents a volume with its snapshots as found in the LXD version 2 metadata.
+// Volume is a volume with its snapshots as listed in the LXD version 2 metadata.
 type Volume struct {
 	api.StorageVolume `yaml:",inline"`
 
 	Snapshots []*api.StorageVolumeSnapshot `yaml:"snapshots,omitempty"`
 }
 
-// Config represents the config of a backup that can be stored in a backup.yaml file (or embedded in index.yaml).
-type Config struct {
-	// Fields only set when reading LXD version 2 metadata, cleared by Normalize.
+type configAlias Config
+
+// rawConfig is Config plus the LXD version 2 keys, which are mapped to the Config fields on load.
+type rawConfig struct {
+	configAlias `yaml:",inline"`
+
 	Version  int                `yaml:"version,omitempty"`
 	Instance *api.Instance      `yaml:"instance,omitempty"`
 	Pools    []*api.StoragePool `yaml:"pools,omitempty"`
 	Volumes  []*Volume          `yaml:"volumes,omitempty"`
+}
 
+// Config represents the config of a backup that can be stored in a backup.yaml file (or embedded in index.yaml).
+type Config struct {
 	Container        *api.Instance                `yaml:"container,omitempty"` // Used by VM backups too.
 	Snapshots        []*api.InstanceSnapshot      `yaml:"snapshots,omitempty"`
 	Pool             *api.StoragePool             `yaml:"pool,omitempty"`
@@ -39,51 +40,80 @@ type Config struct {
 	BucketKeys       []*api.StorageBucketKey      `yaml:"bucket_keys,omitempty"`
 }
 
-// Normalize converts LXD version 2 metadata to the internal (version 1) layout.
-// Mapping follows ConvertFormat's downgrade path in canonical/lxd lxd/backup/backup_config_utils.go.
-func (c *Config) Normalize() error {
-	if c == nil {
+// UnmarshalYAML loads version 1 metadata as is and maps LXD version 2 metadata onto the same fields.
+func (c *Config) UnmarshalYAML(unmarshal func(any) error) error {
+	raw := rawConfig{}
+	err := unmarshal(&raw)
+	if err != nil {
+		return err
+	}
+
+	*c = Config(raw.configAlias)
+
+	switch raw.Version {
+	case 0, 1:
 		return nil
+	case 2:
+		return c.fromV2(&raw)
 	}
 
-	if c.Version > MetadataVersion2 {
-		return fmt.Errorf("Unsupported backup metadata version %d", c.Version)
-	}
+	return fmt.Errorf("Unsupported backup metadata version %d", raw.Version)
+}
 
-	if c.Instance != nil {
-		c.Container = c.Instance
-
-		if len(c.Pools) > 0 {
-			c.Pool = c.Pools[0]
+func (c *Config) fromV2(raw *rawConfig) error {
+	for _, pool := range raw.Pools {
+		if pool == nil {
+			return errors.New("Backup metadata contains a nil pool")
 		}
 	}
 
-	if len(c.Volumes) > 0 {
-		vol := c.Volumes[0]
-		for _, v := range c.Volumes {
-			if v == nil {
-				return errors.New("Backup metadata contains a nil volume")
-			}
+	for _, vol := range raw.Volumes {
+		if vol == nil {
+			return errors.New("Backup metadata contains a nil volume")
+		}
+	}
 
-			// The root volume carries the instance's name and isn't a custom volume.
-			if c.Instance != nil && v.Name == c.Instance.Name && v.Type != "custom" {
+	var vol *Volume
+	var poolName string
+
+	if raw.Instance != nil {
+		c.Container = raw.Instance
+
+		// The root volume has the instance's name and isn't a custom volume.
+		for _, v := range raw.Volumes {
+			if v.Name == raw.Instance.Name && v.Type != "custom" {
 				vol = v
 				break
 			}
 		}
 
-		if vol == nil {
-			return errors.New("Backup metadata contains a nil volume")
+		_, rootDev, err := internalInstance.GetRootDiskDevice(raw.Instance.ExpandedDevices)
+		if err != nil {
+			_, rootDev, _ = internalInstance.GetRootDiskDevice(raw.Instance.Devices)
 		}
 
+		poolName = rootDev["pool"]
+	} else if len(raw.Volumes) > 1 {
+		return errors.New("More than one primary volume is defined in backup metadata")
+	} else if len(raw.Volumes) == 1 {
+		vol = raw.Volumes[0]
+	}
+
+	for _, pool := range raw.Pools {
+		if pool.Name == poolName {
+			c.Pool = pool
+			break
+		}
+	}
+
+	if c.Pool == nil && len(raw.Pools) == 1 {
+		c.Pool = raw.Pools[0]
+	}
+
+	if vol != nil {
 		c.Volume = &vol.StorageVolume
 		c.VolumeSnapshots = vol.Snapshots
 	}
-
-	c.Version = 0
-	c.Instance = nil
-	c.Pools = nil
-	c.Volumes = nil
 
 	return nil
 }
