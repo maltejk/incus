@@ -99,6 +99,11 @@ func GetInfo(r io.ReadSeeker, sysOS *sys.OS, outputPath string) (*Info, error) {
 				return nil, err
 			}
 
+			err = result.Config.Normalize()
+			if err != nil {
+				return nil, err
+			}
+
 			hasIndexFile = true
 
 			// Default to container if index doesn't specify instance type.
@@ -128,6 +133,11 @@ func GetInfo(r io.ReadSeeker, sysOS *sys.OS, outputPath string) (*Info, error) {
 			}
 
 			err = loader.Load(&result.Config)
+			if err != nil {
+				return nil, err
+			}
+
+			err = result.Config.Normalize()
 			if err != nil {
 				return nil, err
 			}

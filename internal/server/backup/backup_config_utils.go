@@ -99,6 +99,11 @@ func ParseConfigYamlFile(path string) (*config.Config, error) {
 		return nil, err
 	}
 
+	err = backupConf.Normalize()
+	if err != nil {
+		return nil, err
+	}
+
 	// Default to container if type not specified in backup config.
 	if backupConf.Container != nil && backupConf.Container.Type == "" {
 		backupConf.Container.Type = string(api.InstanceTypeContainer)
